@@ -1,45 +1,123 @@
 """
 DFL Acceleration Heatmap
 ========================
-Reads the positions.tsv produced by main.py and generates an HTML heatmap
-showing where a specific player had high acceleration during a match.
+Reads the positions.tsv (and players.tsv) produced by main.py and generates
+an HTML heatmap showing where a specific player had high acceleration.
 
 Usage:
-    python acceleration_heatmap.py <positions_tsv> <player_id> [output_html]
+    python acceleration_heatmap.py <output_dir> <name_or_id> [output_html]
 
-    <positions_tsv>  path to positions.tsv
-    <player_id>      the PersonId of the player to visualise
-    [output_html]    output file (default: heatmap_<player_id>.html)
+    <output_dir>   folder containing positions.tsv and players.tsv
+    <name_or_id>   player name (full or partial, case-insensitive) OR a DFL
+                   PersonId — whichever you prefer.
+                   Examples:
+                     "Müller"          → fuzzy-matches against first+last name
+                     "tho"             → matches "Thomas", "Thore", etc.
+                     "DFL-OBJ-00ABCD"  → treated as a direct ID lookup
+    [output_html]  output file (default: heatmap_<player_id>.html)
 
-The pitch dimensions are taken from the data itself (max X/Y values found
-for the match). If you want explicit dimensions, pass --pitch-x and --pitch-y.
+The pitch dimensions are inferred from the data. Pass --pitch-x / --pitch-y
+to override.
 
 Requirements:
-    pip install pandas numpy
-    No other dependencies — the heatmap is rendered entirely in the browser
-    using a self-contained HTML/JS file (Canvas 2D API, no external libs).
+    No third-party packages needed — stdlib only.
 
 How it works:
-    1. Load only the rows for the requested player_id from positions.tsv.
-    2. Convert X/Y coordinates (DFL uses metres, origin at pitch centre) to
-       pixel coordinates on a canvas.
-    3. Bin acceleration values into a 2-D grid.
-    4. Render each cell as a filled rectangle with an opacity proportional to
-       the 95th-percentile-normalised mean acceleration in that cell.
-    5. Overlay a pitch outline (centre circle, penalty areas, halfway line).
+    1. Load players.tsv and fuzzy-match the query against first+last name
+       (or short name). If multiple players match, list them and exit.
+    2. Load only the rows for the resolved player_id from positions.tsv.
+    3. Bin acceleration values into a 2-D grid (60×40 by default).
+    4. Normalise to the 95th percentile so outlier sprints don't flatten
+       the rest of the map.
+    5. Render a self-contained HTML/Canvas file — no external dependencies.
 """
 
 import sys
 import argparse
 import csv
 import json
-import math
 import os
+import unicodedata
+
 
 
 # ---------------------------------------------------------------------------
-# Data loading
+# Player lookup  (name → player_id)
 # ---------------------------------------------------------------------------
+
+def _normalise(s: str) -> str:
+    """Lowercase, strip accents, collapse whitespace."""
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return " ".join(s.lower().split())
+
+
+def load_players(players_tsv: str) -> list[dict]:
+    """Read players.tsv into a list of dicts."""
+    with open(players_tsv, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f, delimiter="\t"))
+
+
+def find_players(players: list[dict], query: str) -> list[dict]:
+    """
+    Return all players whose full name, first name, last name, or short name
+    contains the query string (case- and accent-insensitive).
+
+    If query looks like a DFL PersonId (starts with 'DFL-'), do an exact
+    id match instead.
+    """
+    if query.upper().startswith("DFL-"):
+        return [p for p in players if p["player_id"] == query]
+
+    q = _normalise(query)
+    results = []
+    for p in players:
+        full  = _normalise(f"{p['first_name']} {p['last_name']}")
+        short = _normalise(p.get("short_name", ""))
+        first = _normalise(p.get("first_name", ""))
+        last  = _normalise(p.get("last_name",  ""))
+        if q in full or q in short or q in first or q in last:
+            results.append(p)
+    return results
+
+
+def resolve_player(output_dir: str, query: str) -> dict:
+    """
+    Resolve a name/id query to exactly one player dict.
+    Prints a disambiguation list and exits if 0 or 2+ players match.
+    """
+    players_path = os.path.join(output_dir, "players.tsv")
+    if not os.path.exists(players_path):
+        print(f"ERROR: players.tsv not found in '{output_dir}'.")
+        print("Make sure you point at the folder produced by main.py.")
+        sys.exit(1)
+
+    players = load_players(players_path)
+    matches = find_players(players, query)
+
+    if not matches:
+        print(f"No player found matching '{query}'.")
+        print("Try a different spelling, or pass the DFL PersonId directly.")
+        sys.exit(1)
+
+    if len(matches) == 1:
+        p = matches[0]
+        print(f"Player found: {p['first_name']} {p['last_name']}  "
+              f"({p['player_id']})")
+        return p
+
+    # Multiple matches — print a table so the user can pick
+    print(f"Found {len(matches)} players matching '{query}':\n")
+    print(f"  {'#':<4}  {'Name':<28}  {'Short':<16}  {'ID'}")
+    print(f"  {'-'*4}  {'-'*28}  {'-'*16}  {'-'*20}")
+    for i, p in enumerate(matches, 1):
+        name  = f"{p['first_name']} {p['last_name']}"
+        short = p.get("short_name", "")
+        print(f"  {i:<4}  {name:<28}  {short:<16}  {p['player_id']}")
+    print("\nRe-run with a more specific name or paste the ID directly.")
+    sys.exit(1)
+
+
 
 def load_player_frames(tsv_path: str, player_id: str) -> list[dict]:
     """Stream only the rows belonging to player_id. Returns list of dicts."""
@@ -146,7 +224,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Acceleration Heatmap — {player_id}</title>
+<title>Acceleration Heatmap — {player_name}</title>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
 
@@ -254,7 +332,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <header>
   <h1>Acceleration Heatmap</h1>
-  <p>Player <strong style="color:#58a6ff">{player_id}</strong>
+  <p>Player <strong style="color:#58a6ff">{player_name}</strong>
+     &nbsp;<span style="color:#444d56">({player_id})</span>
      &nbsp;·&nbsp; {n_frames} tracking frames
      &nbsp;·&nbsp; pitch {pitch_x} × {pitch_y} m</p>
 </header>
@@ -436,10 +515,20 @@ canvas.addEventListener("mouseleave", () => {{ tooltip.style.display = "none"; }
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="DFL Acceleration Heatmap")
-    parser.add_argument("positions_tsv", help="Path to positions.tsv")
-    parser.add_argument("player_id",     help="DFL PersonId of the player")
-    parser.add_argument("output_html",   nargs="?", help="Output HTML file")
+    parser = argparse.ArgumentParser(
+        description="DFL Acceleration Heatmap — find a player by name and render their heatmap.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python acceleration_heatmap.py ./output "Müller"
+  python acceleration_heatmap.py ./output "tho"           # partial match
+  python acceleration_heatmap.py ./output "DFL-OBJ-00AB"  # direct ID
+  python acceleration_heatmap.py ./output "Kane" map.html --pitch-x 105 --pitch-y 68
+        """,
+    )
+    parser.add_argument("output_dir",  help="Folder containing positions.tsv and players.tsv")
+    parser.add_argument("player_name", help="Player name (full or partial) or DFL PersonId")
+    parser.add_argument("output_html", nargs="?", help="Output HTML file (default: heatmap_<id>.html)")
     parser.add_argument("--pitch-x", type=float, default=None,
                         help="Pitch length in metres (auto-detected if omitted)")
     parser.add_argument("--pitch-y", type=float, default=None,
@@ -450,16 +539,28 @@ def main():
                         help="Heatmap grid rows (default 40)")
     args = parser.parse_args()
 
-    out_path = args.output_html or f"heatmap_{args.player_id}.html"
+    # --- resolve player ---
+    player = resolve_player(args.output_dir, args.player_name)
+    player_id   = player["player_id"]
+    player_name = f"{player['first_name']} {player['last_name']}".strip()
 
-    print(f"Loading frames for player {args.player_id} …")
-    frames = load_player_frames(args.positions_tsv, args.player_id)
+    out_path      = args.output_html or f"heatmap_{player_id}.html"
+    positions_tsv = os.path.join(args.output_dir, "positions.tsv")
+
+    if not os.path.exists(positions_tsv):
+        print(f"ERROR: positions.tsv not found in '{args.output_dir}'.")
+        sys.exit(1)
+
+    # --- load frames ---
+    print(f"Loading frames for {player_name} ({player_id}) …")
+    frames = load_player_frames(positions_tsv, player_id)
     if not frames:
-        print(f"ERROR: No frames found for player_id '{args.player_id}'.")
-        print("Check that the player_id matches exactly what's in the TSV.")
+        print(f"ERROR: No position frames found for {player_name}.")
+        print("The player may not appear in this match's positions data.")
         sys.exit(1)
     print(f"  {len(frames):,} frames loaded.")
 
+    # --- pitch dimensions ---
     pitch_x = args.pitch_x
     pitch_y = args.pitch_y
     if pitch_x is None or pitch_y is None:
@@ -468,26 +569,26 @@ def main():
         pitch_y = pitch_y or py
         print(f"  Inferred pitch dimensions: {pitch_x} × {pitch_y} m")
 
+    # --- build grid ---
     print("Building acceleration grid …")
     grid_data = build_grid(frames, pitch_x, pitch_y,
                            n_cols=args.cols, n_rows=args.rows)
 
-    # Include raw frames in the JSON so the browser can compute stats.
-    # For very large datasets, cap at 200k frames to keep HTML size sane.
-    MAX_RAW = 200_000
-    raw_sample = frames if len(frames) <= MAX_RAW else frames[::len(frames)//MAX_RAW + 1]
+    # Include raw frames for in-browser stats (cap at 200k to keep HTML lean)
+    MAX_RAW    = 200_000
+    raw_sample = frames if len(frames) <= MAX_RAW else frames[::len(frames) // MAX_RAW + 1]
     grid_data["raw_frames"] = raw_sample
 
     json_str = json.dumps(grid_data, separators=(",", ":"))
 
     html = HTML_TEMPLATE.format(
-        player_id = args.player_id,
-        n_frames  = f"{len(frames):,}",
-        pitch_x   = pitch_x,
-        pitch_y   = pitch_y,
-        p95_acc   = grid_data["p95_acc"],
-        json_str  = "",   # unused placeholder
-        json_data = json_str,
+        player_id   = player_id,
+        player_name = player_name,
+        n_frames    = f"{len(frames):,}",
+        pitch_x     = pitch_x,
+        pitch_y     = pitch_y,
+        p95_acc     = grid_data["p95_acc"],
+        json_data   = json_str,
     )
 
     with open(out_path, "w", encoding="utf-8") as f:
